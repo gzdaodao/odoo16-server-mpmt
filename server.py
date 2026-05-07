@@ -19,6 +19,8 @@ import unittest
 import contextlib
 from io import BytesIO
 from itertools import chain
+from concurrent.futures import ThreadPoolExecutor
+from queue import Queue, Empty
 
 import psutil
 import werkzeug.serving
@@ -66,6 +68,11 @@ from odoo.tools import stripped_sys_argv, dumpstacks, log_ormcache_stats
 _logger = logging.getLogger(__name__)
 
 SLEEP_INTERVAL = 60     # 1 min
+
+# 新增配置项：每个 Worker 进程的线程数
+# 可通过 ODOO_WORKER_THREADS 环境变量或配置文件 workers_threads 设置
+WORKER_THREADS = int(os.environ.get('ODOO_WORKER_THREADS', 
+                    config.get('workers_threads', 4)))
 
 def memory_info(process):
     """
@@ -159,6 +166,12 @@ class RequestHandler(werkzeug.serving.WSGIRequestHandler):
         if self.headers.get('Upgrade') == 'websocket':
             self.rfile = BytesIO()
             self.wfile = BytesIO()
+
+    def log_error(self, format, *args):
+        if format == "Request timed out: %r" and config['test_enable']:
+            _logger.info(format, *args)
+        else:
+            super().log_error(format, *args)
 
 class ThreadedWSGIServerReloadable(LoggingBaseWSGIServerMixIn, werkzeug.serving.ThreadedWSGIServer):
     """ werkzeug Threaded WSGI Server patched to allow reusing a listen socket
@@ -938,11 +951,12 @@ class PreforkServer(CommonServer):
         if config['http_enable']:
             # listen to socket
             _logger.info('HTTP service (werkzeug) running on %s:%s', self.interface, self.port)
+            _logger.info('Worker threads per process: %s', WORKER_THREADS)
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.socket.setblocking(0)
             self.socket.bind((self.interface, self.port))
-            self.socket.listen(8 * self.population)
+            self.socket.listen(128 * self.population)  # 增大 backlog 以适应多线程
 
     def stop(self, graceful=True):
         if self.long_polling_pid is not None:
@@ -1131,8 +1145,9 @@ class Worker(object):
             _logger.exception("Worker %s (%s) Exception occurred, exiting...", self.__class__.__name__, self.pid)
             sys.exit(1)
 
+
 class WorkerHTTP(Worker):
-    """ HTTP Request workers """
+    """ HTTP Request workers with multi-threading support """
     def __init__(self, multi):
         super(WorkerHTTP, self).__init__(multi)
 
@@ -1143,36 +1158,164 @@ class WorkerHTTP(Worker):
         # DoS due to idle HTTP connections.
         sock_timeout = os.environ.get("ODOO_HTTP_SOCKET_TIMEOUT")
         self.sock_timeout = float(sock_timeout) if sock_timeout else 2
+        
+        # 线程池相关配置
+        self.worker_threads = WORKER_THREADS
+        self.thread_pool = None
+        self.request_queue = Queue(maxsize=self.worker_threads * 2)  # 请求队列
+        self.active_threads = set()
+        self.threads_lock = threading.Lock()
+        self.shutdown_event = threading.Event()
 
-    def process_request(self, client, addr):
+    def _worker_thread(self, thread_id):
+        """工作线程函数，处理请求队列中的连接"""
+        thread = threading.current_thread()
+        thread.name = f"odoo.worker.http.{self.pid}.thread{thread_id}"
+        thread.type = 'http'
+        
+        _logger.debug("Worker %s thread %s started", self.pid, thread_id)
+        
+        # 每个工作线程创建自己的 WSGI server 实例
+        server = BaseWSGIServerNoBind(self.multi.app)
+        
+        while not self.shutdown_event.is_set():
+            try:
+                # 从队列获取请求，超时 1 秒以便检查 shutdown 状态
+                client, addr = self.request_queue.get(timeout=1)
+            except Empty:
+                continue
+                
+            if client is None:  # 关闭信号
+                break
+                
+            thread.start_time = time.time()
+            
+            try:
+                self._process_single_request(server, client, addr)
+            except Exception as e:
+                _logger.exception("Worker %s thread %s error processing request: %s", 
+                                  self.pid, thread_id, e)
+            finally:
+                thread.start_time = None
+                self.request_count += 1
+                self.request_queue.task_done()
+                
+                # 检查是否需要退出（达到请求上限）
+                if self.request_count >= self.request_max:
+                    self.alive = False
+                    break
+                    
+                # 检查内存限制
+                self.check_limits()
+                
+        _logger.debug("Worker %s thread %s stopped", self.pid, thread_id)
+
+    def _process_single_request(self, server, client, addr):
+        """处理单个 HTTP 请求"""
         client.setblocking(1)
         client.settimeout(self.sock_timeout)
         client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        # Prevent fd inherientence close_on_exec
+        
+        # Prevent fd inheritance close_on_exec
         flags = fcntl.fcntl(client, fcntl.F_GETFD) | fcntl.FD_CLOEXEC
         fcntl.fcntl(client, fcntl.F_SETFD, flags)
+        
         # do request using BaseWSGIServerNoBind monkey patched with socket
-        self.server.socket = client
+        server.socket = client
+        
         # tolerate broken pipe when the http client closes the socket before
         # receiving the full reply
         try:
-            self.server.process_request(client, addr)
+            server.process_request(client, addr)
         except IOError as e:
             if e.errno != errno.EPIPE:
                 raise
-        self.request_count += 1
+        except Exception:
+            # 确保其他异常也能被捕获并记录
+            raise
 
     def process_work(self):
+        """主循环：接受连接并放入队列"""
         try:
+            # 使用非阻塞 accept，如果没有连接则立即返回
             client, addr = self.multi.socket.accept()
-            self.process_request(client, addr)
+            
+            # 将连接放入队列，如果队列满了则阻塞等待
+            # 这会对主进程的 accept 形成背压，防止无限堆积
+            self.request_queue.put((client, addr), timeout=0.5)
+            
         except socket.error as e:
-            if e.errno not in (errno.EAGAIN, errno.ECONNABORTED):
+            if e.errno not in (errno.EAGAIN, errno.ECONNABORTED, errno.EWOULDBLOCK):
                 raise
+        except Empty:
+            # 队列满了，丢弃这个连接或等待
+            # 这里选择丢弃，让客户端重试
+            pass
+        except Exception as e:
+            _logger.exception("Worker %s accept error: %s", self.pid, e)
 
     def start(self):
         Worker.start(self)
-        self.server = BaseWSGIServerNoBind(self.multi.app)
+        
+        _logger.info("WorkerHTTP %s starting with %s threads", self.pid, self.worker_threads)
+        
+        # 启动工作线程
+        self.threads = []
+        for i in range(self.worker_threads):
+            t = threading.Thread(
+                target=self._worker_thread,
+                args=(i,),
+                name=f"odoo.worker.http.{self.pid}.thread{i}"
+            )
+            t.daemon = False  # 非守护线程，确保优雅关闭
+            t.type = 'http'
+            t.start()
+            self.threads.append(t)
+            with self.threads_lock:
+                self.active_threads.add(t)
+
+    def stop(self):
+        """停止所有工作线程"""
+        _logger.info("WorkerHTTP %s stopping, waiting for %s threads", 
+                     self.pid, len(self.threads))
+        
+        # 发送关闭信号
+        self.shutdown_event.set()
+        
+        # 向队列放入关闭信号
+        for _ in range(len(self.threads)):
+            try:
+                self.request_queue.put((None, None), timeout=0.1)
+            except Empty:
+                pass
+        
+        # 等待所有工作线程完成
+        for t in self.threads:
+            try:
+                t.join(timeout=5)
+            except Exception:
+                pass
+        
+        # 等待队列中剩余的请求处理完成
+        try:
+            # 不等待太久
+            self.request_queue.join()
+        except Exception:
+            pass
+            
+        _logger.info("WorkerHTTP %s stopped", self.pid)
+        
+        Worker.stop(self)
+
+    def check_limits(self):
+        """检查限制，同时清理已完成的线程"""
+        super().check_limits()
+        
+        # 清理已完成的线程
+        with self.threads_lock:
+            dead_threads = {t for t in self.active_threads if not t.is_alive()}
+            self.active_threads -= dead_threads
+
 
 class WorkerCron(Worker):
     """ Cron workers """
@@ -1268,7 +1411,8 @@ class WorkerCron(Worker):
 server = None
 
 def load_server_wide_modules():
-    server_wide_modules = {'base', 'web'} | set(odoo.conf.server_wide_modules)
+    server_wide_modules = list(odoo.conf.server_wide_modules)
+    server_wide_modules.extend(m for m in ('base', 'web') if m not in server_wide_modules)
     for m in server_wide_modules:
         try:
             odoo.modules.module.load_openerp_module(m)
