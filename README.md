@@ -5,6 +5,6 @@ This is a multi-threading transformation of Odoo 16's multi-process mode, enabli
 copy src/server.py to odoo/service/server.py
 then restart odoo
 
-# How to set worker thread per process?
+# How to set worker threads per process?
 add the following line to odoo.conf
 workers_threads = 6
