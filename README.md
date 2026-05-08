@@ -1,3 +1,6 @@
+# Odoo version
+Odoo 16.0-20250326
+
 # What is this?
 This is a multi-threading transformation of Odoo 16's multi-process mode, enabling each worker to launch multiple threads to handle user requests. For I/O-intensive applications, this effectively reduces memory consumption and improves concurrency.
 
