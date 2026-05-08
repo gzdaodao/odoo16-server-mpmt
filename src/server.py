@@ -74,6 +74,10 @@ def _get_worker_threads():
     """延迟读取配置，确保 config 已完全初始化"""
     return int(os.environ.get('ODOO_WORKER_THREADS', 
                               config.get('workers_threads', 4)))
+
+def _get_limit_time_worker_cron():
+    return int(config.get('limit_time_worker_cron', 0))
+
 def memory_info(process):
     """
     :return: the relevant memory usage according to the OS in bytes.
@@ -487,7 +491,7 @@ class ThreadedServer(CommonServer):
                 _logger.warning("PG cluster in recovery mode, cron trigger not activated")
             cr.commit()
             alive_time = time.monotonic()
-            while config['limit_time_worker_cron'] <= 0 or (time.monotonic() - alive_time) <= config['limit_time_worker_cron']:
+            while _get_limit_time_worker_cron() <= 0 or (time.monotonic() - alive_time) <= _get_limit_time_worker_cron():
                 select.select([pg_conn], [], [], SLEEP_INTERVAL + number)
                 time.sleep(number / 100)
                 pg_conn.poll()
@@ -508,7 +512,7 @@ class ThreadedServer(CommonServer):
             with contextlib.closing(conn.cursor()) as cr:
                 _run_cron(cr)
                 cr._cnx.close()
-            _logger.info('cron%d max age (%ss) reached, releasing connection.', number, config['limit_time_worker_cron'])
+            _logger.info('cron%d max age (%ss) reached, releasing connection.', number, _get_limit_time_worker_cron())
 
     def cron_spawn(self):
         """ Start the above runner function in a daemon thread.
@@ -1348,8 +1352,8 @@ class WorkerCron(Worker):
     def check_limits(self):
         super().check_limits()
 
-        if config['limit_time_worker_cron'] > 0 and (time.monotonic() - self.alive_time) > config['limit_time_worker_cron']:
-            _logger.info('WorkerCron (%s) max age (%ss) reached.', self.pid, config['limit_time_worker_cron'])
+        if _get_limit_time_worker_cron() > 0 and (time.monotonic() - self.alive_time) > _get_limit_time_worker_cron():
+            _logger.info('WorkerCron (%s) max age (%ss) reached.', self.pid, _get_limit_time_worker_cron())
             self.alive = False
 
     def _db_list(self):
