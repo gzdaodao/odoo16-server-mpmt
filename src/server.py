@@ -69,11 +69,11 @@ _logger = logging.getLogger(__name__)
 
 SLEEP_INTERVAL = 60     # 1 min
 
-# 新增配置项：每个 Worker 进程的线程数
-# 可通过 ODOO_WORKER_THREADS 环境变量或配置文件 workers_threads 设置
-WORKER_THREADS = int(os.environ.get('ODOO_WORKER_THREADS', 
-                    config.get('workers_threads', 4)))
 
+def _get_worker_threads():
+    """延迟读取配置，确保 config 已完全初始化"""
+    return int(os.environ.get('ODOO_WORKER_THREADS', 
+                              config.get('workers_threads', 4)))
 def memory_info(process):
     """
     :return: the relevant memory usage according to the OS in bytes.
@@ -951,7 +951,7 @@ class PreforkServer(CommonServer):
         if config['http_enable']:
             # listen to socket
             _logger.info('HTTP service (werkzeug) running on %s:%s', self.interface, self.port)
-            _logger.info('Worker threads per process: %s', WORKER_THREADS)
+            _logger.info('Worker threads per process: %s', _get_worker_threads())
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.socket.setblocking(0)
@@ -1160,7 +1160,7 @@ class WorkerHTTP(Worker):
         self.sock_timeout = float(sock_timeout) if sock_timeout else 2
         
         # 线程池相关配置
-        self.worker_threads = WORKER_THREADS
+        self.worker_threads = _get_worker_threads() 
         self.thread_pool = None
         self.request_queue = Queue(maxsize=self.worker_threads * 2)  # 请求队列
         self.active_threads = set()
