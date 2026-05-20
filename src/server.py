@@ -1282,10 +1282,9 @@ class WorkerHTTP(Worker):
         """停止所有工作线程"""
         _logger.info("WorkerHTTP %s stopping, waiting for %s threads", 
                      self.pid, len(self.threads))
-        
-        # 发送关闭信号
-        self.shutdown_event.set()
-        
+
+       
+       
         # 向队列放入关闭信号
         for _ in range(len(self.threads)):
             try:
@@ -1301,11 +1300,19 @@ class WorkerHTTP(Worker):
                 pass
         
         # 等待队列中剩余的请求处理完成
-        try:
-            # 不等待太久
-            self.request_queue.join()
-        except Exception:
-            pass
+        # 线程已经关闭不能等待线程处理消息,否则主线程一直无法退出
+        #try:
+        #    # 不等待太久
+        #    self.request_queue.join()
+        #except Exception:
+        #    pass
+
+        # 发送关闭信号
+        self.shutdown_event.set()
+
+        for t in self.threads:
+            _logger.info("Thread %s: alive=%s, daemon=%s", t.name, t.is_alive(), t.daemon)
+ 
             
         _logger.info("WorkerHTTP %s stopped", self.pid)
         
